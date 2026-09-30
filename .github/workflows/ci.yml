@@ -1,0 +1,220 @@
+name: Go GUI CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc \
+            pkg-config \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            xorg-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols
+
+      - name: Download dependencies
+        run: go mod tidy
+
+      - name: Check formatting
+        run: |
+          test -z "$(gofmt -l .)"
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./... -v
+
+      - name: Build Linux smoke test
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go build \
+            -ldflags="-s -w -X main.version=ci" \
+            -o /tmp/hello-gui \
+            .
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: test
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+            artifact_name: hello-gui-linux-x64
+            output: hello-gui-linux-x64
+            extra_ldflags: ""
+
+          - name: macOS ARM64
+            os: macos-14
+            artifact_name: hello-gui-macos-arm64
+            output: hello-gui-macos-arm64
+            extra_ldflags: ""
+
+          - name: Windows x64
+            os: windows-latest
+            artifact_name: hello-gui-windows-x64
+            output: hello-gui-windows-x64.exe
+            extra_ldflags: "-H windowsgui"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc \
+            pkg-config \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            xorg-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols
+
+      - name: Setup MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkg-config
+
+      - name: Configure MinGW GCC
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $gcc = Get-ChildItem `
+            -Path $env:RUNNER_TEMP, "C:\msys64" `
+            -Filter gcc.exe `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -like "*mingw64*bin*gcc.exe"
+            } |
+            Select-Object -First 1
+
+          if (-not $gcc) {
+            throw "gcc.exe was not found"
+          }
+
+          Write-Host "GCC found at: $($gcc.FullName)"
+
+          $gccDir = Split-Path $gcc.FullName -Parent
+
+          "CC=$($gcc.FullName -replace '\\','/')" >> $env:GITHUB_ENV
+          "$gccDir" >> $env:GITHUB_PATH
+
+      - name: Build GUI binary
+        shell: bash
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go build \
+            -ldflags="-s -w ${{ matrix.extra_ldflags }} -X main.version=${{ github.ref_name }}" \
+            -o "${{ matrix.output }}" \
+            .
+
+      - name: Show binary
+        shell: bash
+        run: |
+          ls -lh "${{ matrix.output }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.output }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hello-gui-linux-x64
+          path: release
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hello-gui-macos-arm64
+          path: release
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hello-gui-windows-x64
+          path: release
+
+      - name: Show release files
+        run: |
+          find release -type f -maxdepth 2 -print
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release/hello-gui-linux-x64/hello-gui-linux-x64
+            release/hello-gui-macos-arm64/hello-gui-macos-arm64
+            release/hello-gui-windows-x64/hello-gui-windows-x64.exe
